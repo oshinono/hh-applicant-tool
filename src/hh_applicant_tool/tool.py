@@ -321,19 +321,12 @@ class HHApplicantTool:
         parser.set_defaults(operation_run=None)
         return parser
 
-    def __post_init__(self) -> None:
-        self._parser = self._create_parser()
+    def __post_init__(self) -> None: ...
 
-        config = self.general_config
-
-        # Эти значения, если они не установлены, берутся из конфига и могут быть
-        # изменены флагами
-        self.user_agent = self.user_agent or config.get(
-            "user_agent", DEFAULT_DESKTOP_USERAGENT
-        )
-        self.base_url = self.base_url or config.get("base_url", HH_BASE_URL)
-        self.captcha_lang = self.captcha_lang or config.get(
-            "captcha_lang", DEFAULT_CAPTCHA_LANGUAGE
+    @property
+    def hh_base_url(self) -> str:
+        return (
+            self.base_url or self.general_config.get("base_url") or HH_BASE_URL
         )
 
     @property
@@ -359,7 +352,11 @@ class HHApplicantTool:
         # В заголовки не лезь, если не понимаешь зачем они
         session.headers.update(
             {
-                "User-Agent": user_agent or self.user_agent,
+                "User-Agent": user_agent
+                or self.user_agent
+                or self.general_config.get(
+                    "user_agent", DEFAULT_DESKTOP_USERAGENT
+                ),
                 "Accept": ACCEPT_HEADER,
                 "Accept-Language": ACCEPT_LANGUAGE_HEADER,
             }
@@ -571,6 +568,10 @@ class HHApplicantTool:
         response: requests.Response,
     ) -> HHLuxInitialState:
         """Возвращает декодированное содержимое <template id="HH-Lux-InitialState"></template>"""
+        if response.status_code in [401, 403]:
+            raise Error(
+                "Аккаунт заблокирован либо требуется повторная авторизация."
+            )
         if response.status_code != 200:
             raise Error(
                 f"Неожиданный код ответа: {response.status_code} {response.url}"
@@ -646,7 +647,9 @@ class HHApplicantTool:
     @property
     def is_logged_in(self) -> bool:
         """Проверяет авторизован ли пользователь через сайт."""
-        return self.session.get(f"{self.base_url}/settings").status_code == 200
+        return (
+            self.session.get(f"{self.hh_base_url}/settings").status_code == 200
+        )
 
     @property
     def xsrf_token(self) -> str | None:
@@ -745,7 +748,9 @@ class HHApplicantTool:
     @cached_property
     def webview_session(self) -> requests.Session:
         return self._create_session(
-            "Android WebView", user_agent=ANDROID_WEBVIEW_USERAGENT
+            "WebView",
+            user_agent=self.general_config.get("webview_user_agent")
+            or ANDROID_WEBVIEW_USERAGENT,
         )
 
     def handle_captcha(
@@ -915,7 +920,7 @@ class HHApplicantTool:
         если нет токена _xsrf.
         """
         session = session or self.session
-        url = urljoin(self.base_url, endpoint)
+        url = urljoin(self.hh_base_url, endpoint)
 
         parts = urlsplit(url)
         origin = f"{parts.scheme}://{parts.netloc}"
@@ -1023,9 +1028,13 @@ class HHApplicantTool:
         session: requests.Session | None = None,
     ) -> CaptchaImage:
         session = session or self.session
-        lang = lang or self.captcha_lang
+        lang = (
+            lang
+            or self.captcha_lang
+            or self.general_config.get("captcha_lang", DEFAULT_CAPTCHA_LANGUAGE)
+        )
 
-        target_url = urljoin(referer_url or self.base_url, "/captcha")
+        target_url = urljoin(referer_url or self.hh_base_url, "/captcha")
         logger.debug(
             "Отправляем POST-запрос на %s для получения captcha key", target_url
         )
@@ -1074,7 +1083,7 @@ class HHApplicantTool:
         """Отправляет введенную капчу."""
 
         captcha_endpoint = "/account/captcha"
-        target_url = urljoin(referer_url or self.base_url, captcha_endpoint)
+        target_url = urljoin(referer_url or self.hh_base_url, captcha_endpoint)
 
         failurl = captcha_endpoint + "?state=" + quote(state)
         if backurl:
@@ -1189,7 +1198,7 @@ class HHApplicantTool:
         return (result or [""])[0]
 
     def logout(self) -> None:
-        self.session.get(f"{self.base_url}/logout", {"hhtmFrom": "main"})
+        self.session.get(f"{self.hh_base_url}/logout", {"hhtmFrom": "main"})
 
         # Она всегда 302 возвращает, даже если ты не авторизован
         # узнать вышел ли ты нельзя
@@ -1352,7 +1361,8 @@ class HHApplicantTool:
             setattr(self, k, v)
 
     def run(self, argv: Sequence[str] | None = None) -> None | int:
-        args = self._parser.parse_args(argv, namespace=BaseNamespace())
+        parser = self._create_parser()
+        args = parser.parse_args(argv, namespace=BaseNamespace())
         self._assign_args(args)
         self.create_config_dir()
         self.setup_logging()
@@ -1361,7 +1371,7 @@ class HHApplicantTool:
         logger.debug("Путь до профиля: %s", self.config_dir_path)
 
         if not self.operation_run:
-            self._parser.print_help(file=sys.stderr)
+            parser.print_help(file=sys.stderr)
             return 2
 
         def on_sigterm(signum, frame):
