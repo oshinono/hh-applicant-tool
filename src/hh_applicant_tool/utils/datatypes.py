@@ -33,8 +33,10 @@ class ResumePlaceholders(TypedDict):
     last_name: str
     resume_title: str
     resume_city: str
+    resume_business_trip_readiness: str
     resume_about: str
     resume_skills: str
+    resume_languages: str
     resume_employment_form: str
     resume_work_format: str
     resume_citizenship: str

@@ -18,8 +18,8 @@ RUN apk add --no-cache --virtual .build-deps gcc musl-dev && \
 
 ENV CONFIG_DIR=/config
 
-RUN mkdir -p /config && chown docker:docker /config
-VOLUME /config
+RUN mkdir -p /config /app/logs && chown docker:docker /config /app/logs
+VOLUME ["/config", "/app/logs"]
 
 USER docker
 

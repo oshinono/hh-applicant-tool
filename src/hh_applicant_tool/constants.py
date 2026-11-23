@@ -55,11 +55,6 @@ CAPTCHA_PROMPT = (
     "Введите текст с картинки выше: "
 )
 
-# Миниммальное время которое должно пройти после решения капчи перед ее
-# отправкой на проверку
-CAPTCHA_SOLVE_MIN_DELAY = 10.0
-CAPTCHA_SOLVE_MAX_DELAY = 15.0
-
 MAX_CAPTCHA_ATTEMPTS = 5
 
 HH_DOMAIN_RE = re.compile(

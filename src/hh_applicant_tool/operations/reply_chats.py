@@ -66,6 +66,10 @@ DEFAULT_USER_PROMPT = """\
 Твои зарплатные ожидания: %(resume_salary)s
 Твои навыки: %(resume_skills)s
 Твое образование: %(resume_education)s
+Город по резюме: %(resume_city)s
+Командировки: %(resume_business_trip_readiness)s
+Языки: %(resume_languages)s
+Дополнительные сведения кандидата: %(candidate_context)s
 Ссылка на Github: %(github_profile_url)s.
 
 Твой опыт:
@@ -91,6 +95,10 @@ DEFAULT_OPTIONS_PROMPT = """\
 Предпочитаемый формат работы: %(resume_work_format)s
 Твои зарплатные ожидания: %(resume_salary)s
 Твои навыки: %(resume_skills)s
+Город по резюме: %(resume_city)s
+Командировки: %(resume_business_trip_readiness)s
+Языки: %(resume_languages)s
+Дополнительные сведения кандидата: %(candidate_context)s
 
 Твой опыт:
 
@@ -1057,6 +1065,7 @@ class Operation(BaseOperation):
             "contact_is_bot": bool(
                 (last.get("participantDisplay") or {}).get("isBot")
             ),
+            "candidate_context": self.tool.general_config.get("candidate_context", ""),
             **self.get_cached_resume_placeholders(chat.resume_id),
         }
 

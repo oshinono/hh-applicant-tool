@@ -4,9 +4,8 @@ import argparse
 import logging
 from typing import TYPE_CHECKING
 
-import requests
-
 from ..tool import BaseNamespace, BaseOperation
+from ..utils.http import LoggedSession
 from ..utils.package import PACKAGE_NAME, get_package_version, parse_version
 
 if TYPE_CHECKING:
@@ -31,7 +30,8 @@ class Operation(BaseOperation):
         pass
 
     def run(self, tool: HHApplicantTool, args: BaseNamespace) -> None:
-        response = requests.get(PYPI_URL, timeout=15)
+        with LoggedSession() as session:
+            response = session.get(PYPI_URL, timeout=15)
         response.raise_for_status()
         pypi_ver = response.json()["info"]["version"]
 

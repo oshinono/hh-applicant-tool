@@ -16,8 +16,9 @@ class XHRError(Error):
 
 
 class CaptchaError(XHRError):
-    def __init__(self, captcha_state: str):
+    def __init__(self, captcha_state: str, http_status: int | None = None):
         self.state = captcha_state
+        self.http_status = http_status
         super().__init__("Captcha required")
 
 

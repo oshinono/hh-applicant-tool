@@ -33,6 +33,16 @@ MANIFEST
 *.manifest
 *.spec
 
+# Local application data
+/logs/
+/token.json
+/cookies.txt
+/config.toml
+/approved*.json
+/*.review.json
+.DS_Store
+.ruff_cache/
+
 # Installer logs
 pip-log.txt
 pip-delete-this-directory.txt

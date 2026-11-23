@@ -12,6 +12,7 @@ from urllib.parse import urlencode, urljoin
 import requests
 
 from ..utils.helpers import get_proxies_dict
+from ..utils.http import LoggedSession
 from . import errors
 from .datatypes import AccessToken
 
@@ -70,7 +71,7 @@ class BaseClient:
 
         if not self.session:
             logger.debug(f"create new session for {class_name}")
-            self.session = requests.session()
+            self.session = LoggedSession()
 
     def _default_headers(self) -> dict[str, str]:
         return {
@@ -327,6 +328,7 @@ class ApiClient(BaseClient):
                 )
             # Глобальный перехват ошибок капчи
             except errors.CaptchaRequired as ex:
+                logger.warning("HH запросил капчу (API, %s)", method.upper())
                 if not self.captcha_handler:
                     raise
                 # Одновременно капчу несколько потоков решать не должны
@@ -334,13 +336,16 @@ class ApiClient(BaseClient):
                     attempts = max_captcha_attempts
                     while attempts:
                         logger.debug(
-                            f"({max_captcha_attempts - attempts + 1}/{max_captcha_attempts}) handle captcha: {ex.captcha_url}"
+                            "Капча API: попытка %d/%d",
+                            max_captcha_attempts - attempts + 1,
+                            max_captcha_attempts,
                         )
                         accepted = self.captcha_handler(ex.captcha_url)
                         if accepted:
-                            logger.info("captcha accepted!")
+                            logger.debug("Капча API: повтор исходного запроса")
                             break
                         attempts -= 1
+                        logger.debug("Капча API: обработчик вернул отказ, осталось попыток: %d", attempts)
                     if accepted:
                         if self.captcha_cooldown > 0:
                             logger.debug(

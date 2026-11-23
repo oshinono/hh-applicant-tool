@@ -6,14 +6,12 @@ import copy
 import html
 import json
 import logging
-import random
 import signal
 import smtplib
 import sys
 import time
 import types
 from collections.abc import Sequence
-from contextlib import contextmanager
 from dataclasses import KW_ONLY, dataclass
 from functools import cached_property
 from http.cookiejar import MozillaCookieJar
@@ -47,8 +45,6 @@ from .constants import (
     ANDROID_CLIENT_SECRET,
     ANDROID_WEBVIEW_USERAGENT,
     CAPTCHA_PROMPT,
-    CAPTCHA_SOLVE_MAX_DELAY,
-    CAPTCHA_SOLVE_MIN_DELAY,
     CAPTCHA_SUCCESS_BACKURL,
     CONFIG_DIR,
     CONFIG_FILENAME,
@@ -70,9 +66,11 @@ from .errors import (
     OperationError,
 )
 from .utils.argparse import ArgumentFormatter
+from .utils.captcha_web import CaptchaWebPrompt
 from .utils.config import ConfigJSON, ConfigTOML
 from .utils.datatypes import ResumePlaceholders
 from .utils.helpers import get_proxies_dict
+from .utils.http import LoggedSession
 from .utils.log import setup_logger
 from .utils.string import shorten
 from .utils.system import has_gui_support, is_docker
@@ -169,6 +167,7 @@ class HHApplicantTool:
     api_delay: float | None = None
     base_url: str | None = None
     captcha_manual: bool = False
+    captcha_web: bool = False
     captcha_handling: bool = True
     captcha_lang: str | None = None
     config_dir: Path | None = None
@@ -256,11 +255,13 @@ class HHApplicantTool:
             help="Таймаут соединения с OpenAI в секундах по умолчанию",
         )
         parser.add_argument(
+            "--use-ai-api",
             "--use-ai",
             "--ai",
+            dest="use_ai",
             action=argparse.BooleanOptionalAction,
             default=True,
-            help="Использовать AI для всех действий в т.ч. решения капчи",
+            help="Использовать настроенный API модели; не влияет на отбор агентом через MCP",
         )
         parser.add_argument(
             "-k",
@@ -295,6 +296,10 @@ class HHApplicantTool:
             help="Ручной ввод капчи. Полезен, если модель не поддерживает vision",
             action="store_true",
             default=False,
+        )
+        parser.add_argument(
+            "--captcha-web", action="store_true",
+            help="Ручной ввод капчи в локальном браузере",
         )
         subparsers = parser.add_subparsers(help="commands")
         package_dir = Path(__file__).resolve().parent / OPERATIONS
@@ -343,7 +348,7 @@ class HHApplicantTool:
         user_agent: str | None = None,
         proxies: dict[str, str] | None = None,
     ) -> requests.Session:
-        session = requests.Session()
+        session = LoggedSession()
         if proxies is None:
             proxies = get_proxies_dict(self.proxy_url)
 
@@ -390,7 +395,7 @@ class HHApplicantTool:
 
     @cached_property
     def ai_session(self) -> requests.Session:
-        session = requests.Session()
+        session = LoggedSession()
         session.headers.update(
             {
                 "User-Agent": f"Mozilla/5.0 (compatible; {PACKAGE_NAME}/{get_package_version()}; +{GITHUB_REPO_URL})",
@@ -416,6 +421,9 @@ class HHApplicantTool:
 
     @cached_property
     def log_file(self) -> Path:
+        root = Path(__file__).resolve().parents[2]
+        if (root / "pyproject.toml").is_file():
+            return root / "logs" / LOG_FILENAME
         return self.config_dir_path / LOG_FILENAME
 
     @cached_property
@@ -668,13 +676,20 @@ class HHApplicantTool:
         return server
 
     def _solve_captcha(self, image_data: bytes) -> str:
+        if prompt := getattr(self, "_captcha_web_prompt", None):
+            logger.debug("Капча: ручной ввод в браузере")
+            return prompt.prompt(image_data)
+
         if self.ai_enabled and not self.captcha_manual:
-            logger.debug("Try recognize CAPTCHA text via AI")
-            return self.captcha_ai.recognize_text(image_data)
+            chat = self.captcha_ai
+            logger.debug("Капча: запрос к модели %s", chat.model)
+            return chat.recognize_text(image_data)
 
         if self._can_use_tkinter():
+            logger.debug("Капча: ручной ввод в Tk")
             return self.prompt_captcha_tkinter(image_data)
 
+        logger.debug("Капча: ручной ввод в терминале")
         return self._prompt_captcha_in_terminal(image_data)
 
     def _can_use_tkinter(self) -> bool:
@@ -700,15 +715,27 @@ class HHApplicantTool:
     ) -> CaptchaSolution:
         """Если API сайта возвращает ответ с hhcaptcha.captchaState, то
         появляется всплывающее окно для ввода капчи"""
+        started = time.monotonic()
         captcha_img = self.get_captcha_image(
             lang=lang,
             referer_url=referer_url,
             xsrf_token=xsrf_token,
             session=session,
         )
-        text = self._solve_captcha(image_data=captcha_img.data)
-        logger.debug(f"Текст с капчи: {text}")
+        input_started = time.monotonic()
+        try:
+            text = self._solve_captcha(image_data=captcha_img.data)
+        except Exception as ex:
+            logger.warning("Капча: сбой получения ответа (%s)", type(ex).__name__)
+            raise
+        elapsed = time.monotonic() - input_started
+        logger.debug("Капча: ответ получен за %.2f с, пустой=%s", elapsed, not text)
+        remaining = 5 - (time.monotonic() - started)
+        if remaining > 0:
+            logger.debug("Wait before retry after captcha: %.2f", remaining)
+            time.sleep(remaining)
 
+        logger.debug("Капча: текст для отправки в HH: %r", text)
         return CaptchaSolution(
             text=text,
             state=captcha_state,
@@ -745,7 +772,7 @@ class HHApplicantTool:
         Возвращает True, если капча принята. Одна попытка; повтор при
         неверном вводе - на стороне вызывающего.
         """
-        logger.debug("captcha url: %s", captcha_url)
+        logger.debug("Капча: загрузка страницы HH")
 
         # На Андроиде WebView сохраняет куки между вызовами, поэтому будем
         # симулировать это поведение
@@ -759,12 +786,12 @@ class HHApplicantTool:
         r.raise_for_status()
 
         redirect_url = r.url
-        logger.debug("Страница капчи, пойдёт в referer: %s", redirect_url)
+        logger.debug("Капча: страница HH загружена, HTTP %d", r.status_code)
 
         query = parse_qs(urlsplit(redirect_url).query)
 
         if "state" not in query:
-            raise ValueError(f"В ссылке на капчу нет state: {redirect_url}")
+            raise ValueError("Капча: на странице HH нет состояния проверки")
         state = query["state"][0]
 
         assert CAPTCHA_SUCCESS_BACKURL in query.get("backurl", [])
@@ -776,14 +803,13 @@ class HHApplicantTool:
         if not xsrf_token:
             raise ValueError("xsrf token отсутствует в Cookies!")
 
-        with self.captcha_retry_delay():
-            solution = self.solve_captcha(
-                captcha_state=state,
-                lang=lang,
-                referer_url=redirect_url,
-                xsrf_token=xsrf_token,
-                session=session,
-            )
+        solution = self.solve_captcha(
+            captcha_state=state,
+            lang=lang,
+            referer_url=redirect_url,
+            xsrf_token=xsrf_token,
+            session=session,
+        )
 
         return self._send_captcha(
             text=solution.text,
@@ -841,7 +867,7 @@ class HHApplicantTool:
             res = {"data": res}
 
         if captcha_state := (res.get("hhcaptcha") or {}).get("captchaState"):
-            raise CaptchaError(captcha_state)
+            raise CaptchaError(captcha_state, r.status_code)
 
         # В res["recaptcha"]["key"] всегда лежит ключ, но не ясно, что еще должно быть, чтобы ошибку рекапчи бросить...
 
@@ -917,7 +943,9 @@ class HHApplicantTool:
         )
 
         logger.debug(
-            "XMLHttpRequest: %s %s %d", r.request.method, r.url, r.status_code
+            "XMLHttpRequest: %s %s %d", r.request.method,
+            urlsplit(r.url).path if parts.path == "/account/captcha" else r.url,
+            r.status_code,
         )
         return self._parse_xhr_response(r)
 
@@ -940,7 +968,7 @@ class HHApplicantTool:
         """
         for attempt in range(MAX_CAPTCHA_ATTEMPTS + 1):
             try:
-                return self._xhr_request(
+                result = self._xhr_request(
                     method,
                     endpoint,
                     params=params,
@@ -951,7 +979,11 @@ class HHApplicantTool:
                     xsrf_token=xsrf_token,
                     session=session,
                 )
+                if attempt:
+                    logger.debug("Капча: повтор исходного веб-запроса, HTTP %s", result.get("http_status"))
+                return result
             except CaptchaError as ex:
+                logger.warning("HH запросил капчу (веб, %s), попыток выполнено: %d", method.upper(), attempt)
                 if not self.handle_captcha:
                     raise
 
@@ -966,11 +998,10 @@ class HHApplicantTool:
                     endpoint,
                 )
 
-                with self.captcha_retry_delay():
-                    solution = self.solve_captcha(
-                        captcha_state=ex.state,
-                        referer_url=referer_url,
-                    )
+                solution = self.solve_captcha(
+                    captcha_state=ex.state,
+                    referer_url=referer_url,
+                )
                 json, data = self._with_captcha(
                     json,
                     data,
@@ -982,22 +1013,6 @@ class HHApplicantTool:
                 )
 
         raise AssertionError("unreachable")
-
-    @contextmanager
-    def captcha_retry_delay(self):
-        """Время задержки после решения капчи будет расти в прогрессии"""
-        start = time.monotonic()
-        try:
-            yield
-        finally:
-            elapsed = time.monotonic() - start
-            delay = random.uniform(
-                CAPTCHA_SOLVE_MIN_DELAY, CAPTCHA_SOLVE_MAX_DELAY
-            )
-            remaining = delay - elapsed
-            if remaining > 0:
-                logger.debug("Wait before retry after captcha: %.2f", remaining)
-                time.sleep(remaining)
 
     def get_captcha_image(
         self,
@@ -1024,12 +1039,13 @@ class HHApplicantTool:
             xsrf_token=xsrf_token,
             session=session,
         )
+        logger.debug("Капча: ответ на запрос ключа, HTTP %s, ключ есть=%s", res.get("http_status"), bool(res.get("key")))
         captcha_key = res["key"]
 
         image_url = urljoin(
             target_url, "/captcha/picture?key=" + quote(captcha_key)
         )
-        logger.debug("Пробуем загрузить капчу: %s", image_url)
+        logger.debug("Капча: загрузка изображения HH")
 
         # Это не XHR: браузер грузит картинку из тега IMG с другим Accept
         # и без XHR-заголовков, поэтому здесь обычный session.get.
@@ -1037,7 +1053,9 @@ class HHApplicantTool:
         if referer_url:
             headers |= {"Referer": referer_url}
 
-        image_data = session.get(image_url, headers=headers).content
+        image = session.get(image_url, headers=headers)
+        image_data = image.content
+        logger.debug("Капча: изображение HH, HTTP %d, %d байт", image.status_code, len(image_data))
 
         assert len(image_data) > 0, "Ошибка загрузки изображения"
 
@@ -1070,7 +1088,15 @@ class HHApplicantTool:
             "failurl": failurl,
         }
 
-        logger.debug(f"POST {target_url}: {payload=}")
+        logger.debug(
+            "Капча: POST %s, тело пустое; параметры URL: %s; "
+            "длина ответа=%d, пробелы по краям=%s, перенос строки=%s",
+            captcha_endpoint,
+            ", ".join(payload),
+            len(text),
+            text != text.strip(),
+            "\n" in text or "\r" in text,
+        )
 
         # payload уходит в query string, тело пустое (так делает браузер).
         # Редиректы xhr_request не выполняет: при успехе 302 ведёт на hh://...,
@@ -1085,9 +1111,18 @@ class HHApplicantTool:
                 xsrf_token=xsrf_token,
                 session=session,
             )
-            logger.debug("%.300s", res)
+            status = res.get("http_status")
+            log = logger.warning if isinstance(status, int) and status >= 400 else logger.debug
+            log("Капча: HH ответил HTTP %s на отправку", status)
             return True
-        except Error:
+        except CaptchaError as ex:
+            logger.warning(
+                "Капча: HH вернул HTTP %s и снова запросил капчу (hhcaptcha.captchaState)",
+                ex.http_status,
+            )
+            return False
+        except Error as ex:
+            logger.warning("Капча: проверка HH завершилась ошибкой (%s)", type(ex).__name__)
             return False
 
     def prompt_captcha_tkinter(self, image_data: bytes) -> str:
@@ -1181,7 +1216,7 @@ class HHApplicantTool:
 
     @staticmethod
     def _format_experience(
-        experience: list[dict[str, Any]] | None, limit: int = 3
+        experience: list[dict[str, Any]] | None, limit: int | None = 3
     ) -> str:
         blocks = []
         for exp in (experience or [])[:limit]:
@@ -1196,15 +1231,13 @@ class HHApplicantTool:
                     ],
                 )
             )
-            # Не надо в описании поэмы писать
-            description = shorten(
-                (exp.get("description") or "").strip(),
-                limit=1000,
-            )
+            description = (exp.get("description") or "").strip()
+            if limit is not None:
+                description = shorten(description, limit=1000)
             blocks.append(f"{head}\n\n{description}".strip())
         return "\n\n".join(blocks)
 
-    def get_resume_placeholders(self, resume_id: str) -> ResumePlaceholders:
+    def get_resume_placeholders(self, resume_id: str, *, full_experience: bool = False) -> ResumePlaceholders:
         """Данные резюме для подстановки в шаблон промпта AI-фильтра."""
 
         resume: api.datatypes.Resume = self.api_client.get(
@@ -1220,10 +1253,18 @@ class HHApplicantTool:
         }
 
         rv["resume_title"] = resume.get("title") or ""
-        rv["resume_city"] = resume.get("area", {}).get("name") or ""
+        rv["resume_city"] = (resume.get("area") or {}).get("name") or ""
+        rv["resume_business_trip_readiness"] = (
+            (resume.get("business_trip_readiness") or {}).get("name") or ""
+        )
         # Почему тут ебаут?
         rv["resume_about"] = resume.get("skills") or ""
         rv["resume_skills"] = ", ".join(resume.get("skill_set") or [])
+        rv["resume_languages"] = ", ".join(
+            " — ".join(filter(None, (language["name"], (language.get("level") or {}).get("name"))))
+            for language in (resume.get("language") or [])
+            if language.get("name")
+        )
         rv["resume_employment_form"] = ", ".join(
             i["name"] for i in (resume.get("employment_form") or [])
         )
@@ -1267,7 +1308,7 @@ class HHApplicantTool:
         )
 
         rv["resume_experience"] = self._format_experience(
-            resume.get("experience") or []
+            resume.get("experience") or [], limit=None if full_experience else 3
         )
         rv["resume_total_experience"] = self._format_total_expirience(
             resume.get("total_experience", {}).get("months") or 0
@@ -1302,6 +1343,7 @@ class HHApplicantTool:
         verbosity_level = max(
             logging.DEBUG, logging.WARNING - self.verbosity * 10
         )
+        self.log_file.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
         setup_logger(logger, verbosity_level, self.log_file)
         setup_terminal()
 
@@ -1328,7 +1370,13 @@ class HHApplicantTool:
         # Костыль для докер
         signal.signal(signal.SIGTERM, on_sigterm)
 
+        prompt = None
         try:
+            if self.captcha_web:
+                if not self.captcha_handling:
+                    raise OperationError("--captcha-web несовместим с --no-handle-captcha")
+                prompt = self._captcha_web_prompt = CaptchaWebPrompt()
+                prompt.open()
             return self.operation_run(self, args)
         except (OperationCanceled, KeyboardInterrupt, EOFError):
             logger.warning("Выполнение операции прервано пользователем!")
@@ -1338,6 +1386,9 @@ class HHApplicantTool:
         except Exception as ex:
             logger.exception(ex)
         finally:
+            if prompt is not None:
+                self._captcha_web_prompt = None
+                prompt.close()
             try:
                 self.save_cookies()
             except Exception as ex:

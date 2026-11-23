@@ -5,6 +5,7 @@ import random
 import re
 import string
 from difflib import SequenceMatcher
+from html.parser import HTMLParser
 from typing import Any
 
 
@@ -93,6 +94,38 @@ def bool2str(v: Any) -> str:
 
 def br2nl(s: str) -> str:
     return re.sub(r"<br\s*/?>", "\n", s, flags=re.I)
+
+
+class _VacancyTextParser(HTMLParser):
+    blocks = {"br", "p", "div", "li", "tr", "td", "th", *(f"h{i}" for i in range(1, 7))}
+
+    def __init__(self):
+        super().__init__()
+        self.parts = []
+        self.hidden = False
+
+    def handle_starttag(self, tag, attrs):
+        if tag in {"script", "style"}:
+            self.hidden = True
+        elif tag in self.blocks:
+            self.parts.append("\n")
+
+    def handle_endtag(self, tag):
+        if tag in {"script", "style"}:
+            self.hidden = False
+        elif tag in self.blocks:
+            self.parts.append("\n")
+
+    def handle_data(self, data):
+        if not self.hidden:
+            self.parts.append(data)
+
+
+def vacancy_description_text(content: str) -> str:
+    parser = _VacancyTextParser()
+    parser.feed(content)
+    parser.close()
+    return "\n".join(line.strip() for line in "".join(parser.parts).splitlines() if line.strip())
 
 
 def strip_tags(content: str) -> str:

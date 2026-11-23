@@ -18,12 +18,14 @@ import requests
 from urllib3.util import Timeout
 
 from ..utils.helpers import get_proxies_dict
+from ..utils.http import LoggedSession
 from .base import AIChat, AIClient, AIError
 
 DEFAULT_DELAY = 0.5
 DEFAULT_TIMEOUT = 90.0
 DEFAULT_CONNECT_TIMEOUT = 15.0
 DEFAULT_MAX_RETRIES = 5
+MAX_RATE_LIMIT_WAIT = 30.0
 DEFAULT_TEMPERATURE = 0.0
 DEFAULT_MAX_COMPLETION_TOKENS = 1000
 
@@ -65,7 +67,7 @@ class OpenAIClient(AIClient):
     proxy_url: str | None = None
 
     session: requests.Session = field(
-        default_factory=requests.Session, repr=False
+        default_factory=LoggedSession, repr=False
     )
 
     # Внутренние поля
@@ -222,6 +224,7 @@ class OpenAIClient(AIClient):
         delay: float | None = None,
         timeout: float | None = None,
         connect_timeout: float | None = None,
+        _trace_vision: bool = False,
         **extra,
     ) -> str:
         """Отправка messages в /chat/completions с retry-логикой.
@@ -252,6 +255,8 @@ class OpenAIClient(AIClient):
             payload |= {"model": model}
 
         for attempt in range(self.max_retries + 1):
+            if _trace_vision:
+                logger.debug("AI vision: модель=%s, попытка %d/%d", model, attempt + 1, self.max_retries + 1)
             try:
                 response = self._request(
                     payload,
@@ -281,6 +286,12 @@ class OpenAIClient(AIClient):
                     raise OpenAIError("OpenAI rate limit exceeded")
 
                 delay = self._get_retry_delay(response, attempt)
+                if not delay <= MAX_RATE_LIMIT_WAIT:
+                    raise OpenAIError(
+                        f"HTTP 429 для модели {model or self.model}: сервер просит ждать "
+                        f"{delay:g} с (максимум {MAX_RATE_LIMIT_WAIT:g} с). "
+                        "Проверьте лимит провайдера и повторите позже."
+                    )
                 logger.warning(
                     "OpenAI returned 429 Too Many Requests, retry in %.2fs",
                     delay,
@@ -291,6 +302,8 @@ class OpenAIClient(AIClient):
 
             try:
                 response.raise_for_status()
+                if _trace_vision:
+                    logger.debug("AI vision: разбираю JSON ответа")
                 data = response.json()
             except requests.exceptions.RequestException as ex:
                 raise OpenAIError(f"Network error: {ex}") from ex
@@ -301,7 +314,17 @@ class OpenAIClient(AIClient):
                 raise OpenAIError(data["error"]["message"])
 
             try:
-                assistant_message = data["choices"][0]["message"]["content"]
+                choice = data["choices"][0]
+                assistant_message = choice["message"]["content"]
+                if _trace_vision:
+                    usage = data.get("usage") or {}
+                    logger.debug(
+                        "AI vision: content: тип=%s, длина=%s; токены: вход=%s, выход=%s",
+                        type(assistant_message).__name__,
+                        len(assistant_message) if isinstance(assistant_message, str) else None,
+                        usage.get("prompt_tokens") if isinstance(usage, dict) else None,
+                        usage.get("completion_tokens") if isinstance(usage, dict) else None,
+                    )
                 return (
                     assistant_message if assistant_message is not None else ""
                 )
@@ -335,11 +358,6 @@ class OpenAIClient(AIClient):
         timeout = timeout or self.timeout
         connect_timeout = connect_timeout or self.connect_timeout
         messages = self._build_messages(system_prompt, message, history)
-
-        logger.debug(
-            "AI запрос: %s",
-            message,
-        )
 
         return self._post_chat(
             messages,
@@ -393,10 +411,11 @@ class OpenAIClient(AIClient):
             history,
         )
 
-        logger.debug("AI vision запрос: %s, %d байт", mime_type, len(data))
+        logger.debug("AI vision: изображение закодировано в Base64 (%s, %d байт), запрос собран", mime_type, len(data))
 
         return self._post_chat(
             messages,
+            _trace_vision=True,
             api_key=api_key,
             model=model,
             temperature=temperature,
